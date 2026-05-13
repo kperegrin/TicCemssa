@@ -19,6 +19,8 @@ especializada como pypdf.
 from __future__ import annotations
 
 import argparse
+import collections
+import collections.abc
 import datetime as dt
 import os
 import re
@@ -780,11 +782,13 @@ def generate_pdf(results: list[ScanResult], scan_path: str, elapsed: float, outp
 def get_icap_header(handler: object, name: str) -> str:
     """Lee una cabecera HTTP/ICAP de pyicap tolerando claves str o bytes."""
 
-    headers = getattr(handler, "headers", {}) or {}
+    headers = getattr(handler, "enc_req_headers", {}) or getattr(handler, "headers", {}) or {}
     wanted = name.lower()
     for key, value in getattr(headers, "items", lambda: [])():
         key_text = key.decode("latin-1", errors="ignore") if isinstance(key, bytes) else str(key)
         if key_text.lower() == wanted:
+            if isinstance(value, list):
+                value = value[0] if value else b""
             return value.decode("latin-1", errors="ignore") if isinstance(value, bytes) else str(value)
     return ""
 
@@ -806,6 +810,11 @@ def run_icap_server(host: str, port: int, strict: bool, max_size: int) -> int:
         pip install pyicap
     """
 
+    # pyicap encara referencia collections.Callable, eliminat en Python modern.
+    # Afegim l'alias abans d'importar pyicap per mantenir compatibilitat.
+    if not hasattr(collections, "Callable"):
+        collections.Callable = collections.abc.Callable
+
     try:
         from pyicap import BaseICAPRequestHandler, ICAPServer
     except ImportError:
@@ -824,17 +833,15 @@ def run_icap_server(host: str, port: int, strict: bool, max_size: int) -> int:
             self.send_headers(False)
 
         def scan_REQMOD(self):
-            self.read_request_line()
-            self.read_headers()
-
             body = bytearray()
-            while True:
-                chunk = self.rfile.read(8192)
-                if not chunk:
-                    break
-                body.extend(chunk)
-                if len(body) > max_size:
-                    break
+            if self.has_body:
+                while True:
+                    chunk = self.read_chunk()
+                    if chunk == b"":
+                        break
+                    body.extend(chunk)
+                    if len(body) > max_size:
+                        break
 
             content_type = get_icap_header(self, "Content-Type")
             results = scan_upload_payload(bytes(body), content_type, strict, max_size)
@@ -842,13 +849,16 @@ def run_icap_server(host: str, port: int, strict: bool, max_size: int) -> int:
             log_icap_results(results, allowed)
 
             if allowed:
-                self.set_icap_response(200)
-                self.send_headers(True)
-                self.write(bytes(body))
+                self.no_adaptation_required()
             else:
-                self.set_icap_response(403)
-                self.set_enc_status(b"403 Forbidden")
-                self.send_headers(False)
+                error_body = b"Upload bloquejat per dades sensibles.\n"
+                self.set_icap_response(200)
+                self.set_enc_status(b"HTTP/1.1 403 Forbidden")
+                self.set_enc_header(b"Content-Type", b"text/plain; charset=utf-8")
+                self.set_enc_header(b"Content-Length", str(len(error_body)).encode("ascii"))
+                self.send_headers(True)
+                self.write_chunk(error_body)
+                self.write_chunk(b"")
 
     class ThreadedServer(socketserver.ThreadingMixIn, ICAPServer):
         daemon_threads = True
