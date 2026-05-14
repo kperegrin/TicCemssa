@@ -18,11 +18,11 @@ import socket
 from pathlib import Path
 
 
-def recv_all(sock: socket.socket) -> bytes:
+def recv_all(sock: socket.socket, timeout: int) -> bytes:
     """Llegeix tota la resposta fins que el servidor tanca o expira el timeout."""
 
     chunks: list[bytes] = []
-    sock.settimeout(5)
+    sock.settimeout(timeout)
     while True:
         try:
             chunk = sock.recv(8192)
@@ -34,7 +34,7 @@ def recv_all(sock: socket.socket) -> bytes:
     return b"".join(chunks)
 
 
-def icap_options(host: str, port: int, service: str) -> bytes:
+def icap_options(host: str, port: int, service: str, timeout: int) -> bytes:
     """Envia OPTIONS per comprovar que el servei ICAP respon."""
 
     request = (
@@ -43,13 +43,13 @@ def icap_options(host: str, port: int, service: str) -> bytes:
         "\r\n"
     ).encode("latin-1")
 
-    with socket.create_connection((host, port), timeout=5) as sock:
+    with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.sendall(request)
         sock.shutdown(socket.SHUT_WR)
-        return recv_all(sock)
+        return recv_all(sock, timeout)
 
 
-def icap_reqmod(host: str, port: int, service: str, file_path: Path) -> bytes:
+def icap_reqmod(host: str, port: int, service: str, file_path: Path, timeout: int) -> bytes:
     """Envia un fitxer com si fos un upload HTTP encapsulat dins REQMOD."""
 
     body = file_path.read_bytes()
@@ -73,10 +73,10 @@ def icap_reqmod(host: str, port: int, service: str, file_path: Path) -> bytes:
         "\r\n"
     ).encode("latin-1")
 
-    with socket.create_connection((host, port), timeout=5) as sock:
+    with socket.create_connection((host, port), timeout=timeout) as sock:
         sock.sendall(icap_headers + http_headers + chunked_body)
         sock.shutdown(socket.SHUT_WR)
-        return recv_all(sock)
+        return recv_all(sock, timeout)
 
 
 def first_line(response: bytes) -> str:
@@ -91,6 +91,7 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=1345)
     parser.add_argument("--service", default="scan")
+    parser.add_argument("--timeout", type=int, default=120, help="Segons d'espera per resposta ICAP")
     parser.add_argument("--skip-options", action="store_true")
     args = parser.parse_args()
 
@@ -100,10 +101,10 @@ def main() -> int:
         return 2
 
     if not args.skip_options:
-        options_response = icap_options(args.host, args.port, args.service)
+        options_response = icap_options(args.host, args.port, args.service, args.timeout)
         print("OPTIONS:", first_line(options_response))
 
-    response = icap_reqmod(args.host, args.port, args.service, file_path)
+    response = icap_reqmod(args.host, args.port, args.service, file_path, args.timeout)
     status = first_line(response)
     print("REQMOD: ", status)
 
