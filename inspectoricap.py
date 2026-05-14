@@ -5,15 +5,16 @@ Inspector de dades sensibles en Python.
 Flujo general:
 1. Recibe ficheros o un directorio desde la CLI.
 2. Extrae texto segun el formato.
-3. Aplica patrones de datos sensibles.
+3. Aplica patrones de datos sensibles y, si esta disponible, NER multilingue.
 4. Genera un informe TXT o PDF y devuelve:
    - 0 si no hay datos sensibles.
    - 1 si se detectan datos sensibles.
    - 2 si hay un error de uso.
 
-No requiere dependencias externas. Los extractores integrados son suficientes
-para documentos simples; para PDF muy complejos conviene anadir una libreria
-especializada como pypdf.
+No requiere dependencias externas para funcionar. Si transformers/torch estan
+instalados, anade deteccion NER multilingue compatible con catalan, castellano
+e ingles; para PDF muy complejos conviene anadir una libreria especializada
+como pypdf.
 """
 
 from __future__ import annotations
@@ -31,14 +32,43 @@ import time
 import zipfile
 import zlib
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 from xml.etree import ElementTree as ET
 
 
-APP_VERSION = "3.0.0-py"
+APP_VERSION = "3.1.0-py"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
+DEFAULT_NER_MODEL = "Babelscape/wikineural-multilingual-ner"
+NER_MIN_SCORE = 0.75
+NER_MAX_TEXT_CHARS = 250_000
+
+PERSON_CONTEXT = (
+    "name", "full name", "first name", "last name", "surname", "holder",
+    "customer", "client", "contact", "signatory", "representative",
+    "nombre", "nombre y apellidos", "apellidos", "apellido", "titular",
+    "cliente", "clienta", "contacto", "firmante", "representante",
+    "solicitante", "nom", "nom i cognoms", "cognoms", "cognom",
+    "titular", "client", "clienta", "contacte", "signat", "signant",
+    "representant", "sol.licitant", "sol·licitant",
+)
+
+ADDRESS_CONTEXT = (
+    "address", "street", "road", "avenue", "postcode", "postal code",
+    "adreça", "adreca", "domicili", "carrer", "avinguda", "passeig",
+    "plaça", "placa", "rambla", "camí", "cami", "passatge",
+    "dirección", "direccion", "domicilio", "calle", "avenida", "paseo",
+    "plaza", "ronda", "bulevar", "urbanización", "urbanizacion",
+    "polígono", "poligono", "cp", "codi postal", "codigo postal",
+)
+
+NAME_TOKEN = r"[A-ZÀ-ÖØ-Þ][a-zà-öø-ÿ'·.-]{1,30}"
+NAME_PARTICLE = r"(?:d'|de|del|de[^\S\n]+la|de[^\S\n]+les|de[^\S\n]+los|de[^\S\n]+las|dels|dos|da|van|von|y|i)"
+PERSON_NAME_REGEX = (
+    rf"{NAME_TOKEN}(?:[^\S\n]+(?:{NAME_PARTICLE}[^\S\n]+)?{NAME_TOKEN}){{1,4}}"
+)
 
 SUPPORTED_EXT = {
     "txt", "csv", "log", "md", "ini", "json", "xml", "yaml", "yml",
@@ -102,12 +132,22 @@ def get_patterns() -> dict[str, PatternDef]:
     return {
         "DNI / NIE": PatternDef(
             re.compile(r"\b(?:[0-9]{8}[A-Za-z]|[XYZxyz][0-9]{7}[A-Za-z])\b"),
-            ("dni", "nif", "nie", "document", "identif"),
+            ("dni", "nif", "nie", "document", "documento", "identity", "id", "identif"),
+            True,
+        ),
+        "Matricula vehicle": PatternDef(
+            re.compile(r"\b(?:[0-9]{4}[\s-]?[BCDFGHJKLMNPRSTVWXYZ]{3}|[A-Z]{1,2}[\s-]?[0-9]{4}[\s-]?[A-Z]{1,2})\b", re.IGNORECASE),
+            ("matricula", "matrícula", "placa", "vehicle", "vehiculo", "vehículo", "license plate", "number plate"),
+            True,
+        ),
+        "Codi segur de verificacio (CSV)": PatternDef(
+            re.compile(r"\b(?:CSV|codi segur(?: de verificacio| de verificació)?|c[oó]digo seguro(?: de verificaci[oó]n)?|secure verification code)\s*[:=]\s*([A-Z0-9]+(?:-[A-Z0-9]+){1,5})\b", re.IGNORECASE),
+            ("csv", "codi segur", "codigo seguro", "código seguro", "verificacio", "verificació", "verificacion", "verificación", "secure verification code"),
             True,
         ),
         "Telefon": PatternDef(
             re.compile(r"(?<!\d)(?:\+34[\s.\-]?|0034[\s.\-]?)?[6789]\d{2}[\s.\-]?\d{3}[\s.\-]?\d{3}(?!\d)"),
-            ("tel", "fax", "movil", "phone", "contacte"),
+            ("tel", "fax", "movil", "móvil", "mobile", "phone", "telephone", "contacte", "contacto", "contact"),
             True,
         ),
         "Correu electronic": PatternDef(
@@ -121,13 +161,13 @@ def get_patterns() -> dict[str, PatternDef]:
             True,
         ),
         "CVV": PatternDef(
-            re.compile(r"\b(?:cvv|cvc|csv|security code)[\s:]*(\d{3,4})\b", re.IGNORECASE),
-            ("cvv", "cvc", "card", "targeta"),
+            re.compile(r"\b(?:cvv|cvc|csc|security code)[\s:]*(\d{3,4})\b", re.IGNORECASE),
+            ("cvv", "cvc", "csc", "card", "targeta"),
             True,
         ),
         "IBAN": PatternDef(
             re.compile(r"\b[A-Z]{2}[0-9]{2}(?:\s?[0-9]{4}){4,6}(?:\s?[0-9]{1,4})?\b"),
-            ("iban", "compte", "cuenta", "bank", "transfer"),
+            ("iban", "compte", "cuenta", "account", "bank", "banc", "banco", "transfer", "transferencia"),
             True,
         ),
         "Contrasenya": PatternDef(
@@ -136,26 +176,30 @@ def get_patterns() -> dict[str, PatternDef]:
             True,
         ),
         "Nom i cognoms": PatternDef(
-            re.compile(r"\b([A-ZÀ-Ÿ][a-zà-ÿ]{1,20}(?:\s+[A-ZÀ-Ÿ][a-zà-ÿ]{1,20}){2,3})\b"),
-            ("name", "nombre", "nom", "cognoms", "apellido", "titular", "client", "clienta", "signat"),
+            re.compile(
+                rf"(?:\b(?:nom(?:\s+i\s+cognoms)?|nombre(?:\s+y\s+apellidos)?|full\s+name|name|apellidos?|cognoms?|titular|clienta?|cliente|customer|contacte|contacto|contact|signat(?:ari)?|signant|firmante|representant|representante|sol[.·]?licitant|solicitante)\s*[:=\-]\s*)?({PERSON_NAME_REGEX})\b"
+            ),
+            PERSON_CONTEXT,
             False,
         ),
         "Adreca postal": PatternDef(
             re.compile(
-                r"(?:Gran\s+Via|Avinguda|Avenida|Avda\.|Avda|Av\.|Av|Travessera|Traves[ií]a|Trav\.|Passatge|Ptge\.|Passeig|Pg\.|Paseo|P\.º|Carrer|Calle|Callej\.|Callejon|Cal|Bulevar|Blv\.|Urbanitzaci[oó]|Urbanizaci[oó]n|Urb\.|Urb|Pol[ií]gonos?|Pol\.|Glorieta|Glta\.|Rambla|Rbla\.|Ronda|Cam[ií]|Camino|Cami|Pla[cç]a|Plaza|Pza\.|Plza\.|Pl\.|Via|C/)"
+                r"(?:Gran\s+Via|Avinguda|Avenida|Avenue|Avda\.|Avda|Ave\.|Ave|Av\.|Av|Travessera|Traves[ií]a|Trav\.|Passatge|Ptge\.|Passeig|Pg\.|Paseo|P\.º|Carrer|Calle|Street|St\.|Road|Rd\.|Lane|Ln\.|Drive|Dr\.|Callej\.|Callejon|Callejón|Cal|Bulevar|Blv\.|Boulevard|Urbanitzaci[oó]|Urbanizaci[oó]n|Urb\.|Urb|Pol[ií]gonos?|Pol\.|Glorieta|Glta\.|Rambla|Rbla\.|Ronda|Cam[ií]|Camino|Cami|Pla[cç]a|Plaza|Pza\.|Plza\.|Pl\.|Via|C/)"
                 r"(?:[^\S\n]+(?:de\s+la|de\s+les|de\s+los|de\s+las|dels|del|de|d'))?"
-                r"[^\S\n]+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ \-]{1,50}[, ]+\d{1,5}"
+                r"[^\S\n]+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'\-]{1,60}[, ]+\d{1,5}[A-Za-z]?"
                 r"(?:[, ]+(?:\d{1,3}[rRtTèéaAºª](?: *[0-9a-zA-Z]{1,3})?|[Bb]aixos|[Bb]ajos|[Ee]ntresol|[Pp]rincipal|[Pp]ral\.?|[Áá]tico|[Àà]tic|[Ll]ocal|[Ee]sc\.? *[A-Z]))?"
-                r"(?:[ ,\-—]+(?:CP[ .:]*)?[0-5]\d{4}(?: +[A-ZÀ-ÿ][A-Za-zÀ-ÿ \-]{2,30})?)?"
+                r"(?:[ ,\-—]+(?:CP|C\.?P\.?|ZIP|Postcode|Postal code)?[ .:]*(?:[0-5]\d{4}|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})(?: +[A-ZÀ-ÿ][A-Za-zÀ-ÿ \-]{2,30})?)?"
             ),
-            (
-                "adreça", "adreca", "domicili", "carrer", "avinguda", "passeig",
-                "plaça", "placa", "rambla", "camí", "cami", "passatge",
-                "dirección", "direccion", "domicilio", "calle", "avenida",
-                "paseo", "plaza", "ronda", "bulevar", "urbanizacion",
-                "poligono", "adress", "address", "via", "cp",
-                "codi postal", "codigo postal",
+            ADDRESS_CONTEXT,
+            True,
+        ),
+        "Adreca postal anglesa": PatternDef(
+            re.compile(
+                r"\b[A-ZÀ-ÿ][A-Za-zÀ-ÿ .'\-]{1,60}[^\S\n]+(?:Street|St\.|Road|Rd\.|Avenue|Ave\.|Lane|Ln\.|Drive|Dr\.|Boulevard|Blvd\.)[, ]+\d{1,5}[A-Za-z]?"
+                r"(?:[ ,\-]+(?:ZIP|Postcode|Postal code)?[ .:]*(?:\d{5}(?:-\d{4})?|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2}))?\b",
+                re.IGNORECASE,
             ),
+            ADDRESS_CONTEXT,
             True,
         ),
         "Data de naixement": PatternDef(
@@ -182,6 +226,42 @@ def norm_val(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip().lower()
 
 
+def clean_match_value(type_name: str, value: str) -> str:
+    """Recorta artefactos habituales de extraccion antes de deduplicar."""
+
+    value = re.sub(r"\s+", " ", value).strip(" \t\r\n.;,")
+    next_label = (
+        "DNI", "NIE", "NIF", "Telefon", "Telèfon", "Telefono", "Teléfono",
+        "Correu", "Correo", "Email", "Adreca", "Adreça", "Direccion",
+        "Dirección", "Address", "Matricula", "Matrícula", "IBAN", "CSV",
+        "Contrasenya", "Contraseña", "Password",
+    )
+    label_pattern = r"\s+(?:" + "|".join(re.escape(label) for label in next_label) + r")\b.*$"
+    if type_name in {"Adreca postal", "Adreca postal anglesa", "Contrasenya"}:
+        value = re.sub(label_pattern, "", value, flags=re.IGNORECASE).strip(" \t\r\n.;,")
+    if type_name == "Contrasenya":
+        value = value.rstrip(")")
+    return value
+
+
+def add_unique_match(unique: dict[str, str], value: str) -> None:
+    """Afegeix un valor evitant duplicats i variants mes llargues del mateix."""
+
+    key = norm_val(value)
+    if not key:
+        return
+    for existing_key, existing_value in list(unique.items()):
+        if key == existing_key:
+            return
+        if key in existing_key and len(existing_key) > len(key) + 3:
+            unique.pop(existing_key)
+            unique[key] = value
+            return
+        if existing_key in key and len(key) > len(existing_key) + 3:
+            return
+    unique[key] = value
+
+
 def is_likely_name_false_positive(value: str) -> bool:
     """
     Descarta falsos positivos de "Nom i cognoms".
@@ -192,7 +272,11 @@ def is_likely_name_false_positive(value: str) -> bool:
     """
 
     words = re.split(r"\s+", value.strip())
-    if len(words) < 3:
+    relevant_words = [
+        word for word in words
+        if word.lower() not in {"de", "del", "la", "les", "los", "las", "dels", "i", "y"}
+    ]
+    if len(relevant_words) < 2:
         return True
 
     text = f" {norm_val(value)} "
@@ -201,11 +285,123 @@ def is_likely_name_false_positive(value: str) -> bool:
         "client", "description", "document", "electronics", "email", "fake",
         "holder", "information", "item", "kitchen", "mouse", "notebook",
         "office", "payment", "phone", "sports", "status", "stock",
-        "synthetic", "test", "this", "water", "wireless", "yoga",
+        "synthetic", "test", "this", "water", "wireless", "yoga", "customer",
+        "invoice", "report", "confidential", "license", "plate", "street",
+        "road", "avenue", "drive", "lane",
         "adreca", "adreça", "categoria", "correu", "descripcio",
         "descripció", "disponible", "estat", "telefon", "telèfon",
+        "document", "factura", "informe", "matricula", "matrícula", "carrer",
+        "avinguda", "passeig", "plaça", "placa", "rambla",
+        "direccion", "dirección", "telefono", "teléfono", "correo",
+        "electronico", "electrónico", "disponible", "calle", "avenida",
+        "paseo", "plaza",
     }
     return any(f" {term.lower()} " in text for term in non_person_terms)
+
+
+def merge_findings(findings: list[Finding], extra: Iterable[Finding]) -> list[Finding]:
+    """Une resultados de regex y NER sin duplicar valores normalizados."""
+
+    by_type: dict[str, dict[str, str]] = {}
+    for finding in findings:
+        values: dict[str, str] = {}
+        for match in finding.matches:
+            add_unique_match(values, match)
+        by_type[finding.type] = values
+    for finding in extra:
+        values = by_type.setdefault(finding.type, {})
+        for match in finding.matches:
+            add_unique_match(values, match)
+    return [Finding(type_name, list(matches.values())) for type_name, matches in by_type.items() if matches]
+
+
+@lru_cache(maxsize=1)
+def get_ner_pipeline() -> Any | None:
+    """
+    Carga un pipeline NER multilingüe si las dependencias estan disponibles.
+
+    Por defecto usa un modelo multilingüe basado en XLM-RoBERTa. Se puede
+    cambiar con INSPECTOR_NER_MODEL o desactivar con INSPECTOR_DISABLE_NER=1.
+    """
+
+    if os.environ.get("INSPECTOR_DISABLE_NER", "").lower() in {"1", "true", "yes"}:
+        return None
+    try:
+        from transformers import pipeline
+    except ImportError:
+        return None
+
+    model_name = os.environ.get("INSPECTOR_NER_MODEL", DEFAULT_NER_MODEL)
+    try:
+        return pipeline(
+            "token-classification",
+            model=model_name,
+            tokenizer=model_name,
+            aggregation_strategy="simple",
+        )
+    except Exception as exc:
+        print(f"Avis: NER no disponible ({exc})", file=sys.stderr)
+        return None
+
+
+def split_ner_chunks(text: str, chunk_size: int = 1800) -> Iterable[str]:
+    """Divide texto largo para no superar el tamano habitual del modelo."""
+
+    current: list[str] = []
+    current_len = 0
+    for paragraph in re.split(r"(\n{2,})", text[:NER_MAX_TEXT_CHARS]):
+        if current_len + len(paragraph) > chunk_size and current:
+            yield "".join(current)
+            current = []
+            current_len = 0
+        current.append(paragraph)
+        current_len += len(paragraph)
+    if current:
+        yield "".join(current)
+
+
+def ner_label(entity: dict[str, Any]) -> str:
+    """Normaliza etiquetas BIO/agregadas de distintos modelos NER."""
+
+    raw = str(entity.get("entity_group") or entity.get("entity") or entity.get("label") or "")
+    return raw.upper().removeprefix("B-").removeprefix("I-")
+
+
+def scan_ner_entities(text: str, strict: bool) -> list[Finding]:
+    """Detecta personas con NER multilingüe y las agrega al informe."""
+
+    ner = get_ner_pipeline()
+    if ner is None:
+        return []
+
+    persons: dict[str, str] = {}
+    lower_text = text.lower()
+    has_person_context = any(ctx.lower() in lower_text for ctx in PERSON_CONTEXT)
+
+    for chunk in split_ner_chunks(text):
+        try:
+            entities = ner(chunk)
+        except Exception as exc:
+            print(f"Avis: error executant NER ({exc})", file=sys.stderr)
+            return []
+
+        for entity in entities:
+            label = ner_label(entity)
+            if label not in {"PER", "PERSON"}:
+                continue
+            if float(entity.get("score") or 0.0) < NER_MIN_SCORE:
+                continue
+            value = str(entity.get("word") or "").replace("##", "").strip()
+            value = re.sub(r"\s+", " ", value)
+            if not value or is_likely_name_false_positive(value):
+                continue
+            if not strict and not has_person_context and len(value.split()) < 2:
+                continue
+            persons.setdefault(norm_val(value), value)
+
+    if not persons:
+        return []
+    return [Finding("Nom i cognoms", list(persons.values()))]
 
 
 def ascii85_decode(data: bytes) -> bytes:
@@ -302,15 +498,15 @@ def extract_pdf(path: Path) -> str:
         for match in re.finditer(rb"\[([^\[\]]*)\]\s*TJ", data, re.S):
             for part in re.finditer(rb"\(([^)\\]*(?:\\.[^)\\]*)*)\)", match.group(1), re.S):
                 text.append(pdf_literal_to_text(part.group(1)))
-            text.append(" ")
+            text.append("\n")
 
         offset = end_pos + len(b"endstream")
 
     ascii_chunks = re.findall(rb"[\x20-\x7E]{6,}", raw)
-    if ascii_chunks:
+    if ascii_chunks and not text:
         text.append(" ".join(chunk.decode("latin-1", errors="ignore") for chunk in ascii_chunks))
 
-    return " ".join(text)
+    return "\n".join(part.strip() for part in text if part.strip())
 
 
 def xml_text(xml_data: bytes, tags: Iterable[str] | None = None) -> str:
@@ -464,17 +660,17 @@ def scan_text(text: str, strict: bool) -> list[Finding]:
 
         unique: dict[str, str] = {}
         for match in matches:
-            original = (match.group(1) if match.lastindex else match.group(0)).strip()
+            original = clean_match_value(type_name, match.group(1) if match.lastindex else match.group(0))
+            if type_name == "Matricula vehicle" and norm_val(original).endswith(" csv"):
+                continue
             if type_name == "Nom i cognoms" and is_likely_name_false_positive(original):
                 continue
-            key = norm_val(original)
-            if key and key not in unique:
-                unique[key] = original
+            add_unique_match(unique, original)
 
         if unique:
             findings.append(Finding(type_name, list(unique.values())))
 
-    return findings
+    return merge_findings(findings, scan_ner_entities(text, strict))
 
 
 def is_binary(path: Path) -> bool:
@@ -846,7 +1042,8 @@ def run_icap_server(host: str, port: int, strict: bool, max_size: int) -> int:
             content_type = get_icap_header(self, "Content-Type")
             results = scan_upload_payload(bytes(body), content_type, strict, max_size)
             allowed = not results_are_sensitive(results)
-            log_icap_results(results, allowed)
+            if not allowed:
+                log_icap_results(results, allowed)
 
             if allowed:
                 self.no_adaptation_required()
