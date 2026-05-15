@@ -69,6 +69,33 @@ NAME_PARTICLE = r"(?:d'|de|del|de[^\S\n]+la|de[^\S\n]+les|de[^\S\n]+los|de[^\S\n
 PERSON_NAME_REGEX = (
     rf"{NAME_TOKEN}(?:[^\S\n]+(?:{NAME_PARTICLE}[^\S\n]+)?{NAME_TOKEN}){{1,4}}"
 )
+ORG_SUFFIX = r"(?:S\.?L\.?U?|S\.?L\.?|S\.?A\.?|SLL|SCP|S\.? Coop\.?|Coop\.?|Associaci[oó]|Fundaci[oó]|Ute|UTE)"
+ORG_CONTEXT = (
+    "empresa", "societat", "sociedad", "company", "entitat", "entidad",
+    "proveidor", "proveedor", "contractista", "organisme", "organismo",
+    "ajuntament", "agencia", "agència", "administracio", "administració",
+)
+ADDRESS_TYPE = (
+    r"Gran\s+Via|Avinguda|Avenida|Avenue|Avda\.?|Ave\.?|Av\.?|Travessera|"
+    r"Traves[ií]a|Trav\.|Passatge|Ptge\.|Passeig|Pg\.|Paseo|P\.º|Carrer|"
+    r"Calle|Street|St\.|Road|Rd\.|Lane|Ln\.|Drive|Dr\.|Callej\.|Callejon|"
+    r"Callejón|Cal|Bulevar|Blv\.|Boulevard|Urbanitzaci[oó]|Urbanizaci[oó]n|"
+    r"Urb\.?|Pol[ií]gonos?|Pol\.|Glorieta|Glta\.|Rambla|Rbla\.|Ronda|"
+    r"Cam[ií]|Camino|Cami|Pla[cç]a|Plaza|Pza\.|Plza\.|Pl\.|Via|C/"
+)
+ADDRESS_REGEX = (
+    rf"(?:{ADDRESS_TYPE})"
+    r"(?:[^\S\n]+(?:de\s+la|de\s+les|de\s+los|de\s+las|dels|del|de|d'))?"
+    r"[^\S\n]+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'\-]{1,70}"
+    r"(?:[, ]+|[^\S\n]+(?:num\.?|n[uú]m\.?|n[ºo]\.?)[^\S\n]*)"
+    r"\d{1,5}[A-Za-z]?"
+    r"(?:[, ]+(?:\d{1,3}[rRtTèéaAºª](?: *[0-9a-zA-Z]{1,3})?|[Bb]aixos|"
+    r"[Bb]ajos|[Ee]ntresol|[Pp]rincipal|[Pp]ral\.?|[Áá]tico|[Àà]tic|"
+    r"[Ll]ocal|[Ee]sc\.? *[A-Z]))?"
+    r"(?:[ ,\-—]+(?:CP|C\.?P\.?|ZIP|Postcode|Postal code)?[ .:]*"
+    r"(?:[0-5]\d{4}|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})"
+    r"(?: +[A-ZÀ-ÿ][A-Za-zÀ-ÿ \-]{2,30})?)?"
+)
 
 SUPPORTED_EXT = {
     "txt", "csv", "log", "md", "ini", "json", "xml", "yaml", "yml",
@@ -135,13 +162,26 @@ def get_patterns() -> dict[str, PatternDef]:
             ("dni", "nif", "nie", "document", "documento", "identity", "id", "identif"),
             True,
         ),
+        "NIF empresa / CIF": PatternDef(
+            re.compile(r"\b(?:ES\s*)?[ABCDEFGHJKLMNPQRSUVW][\s-]?\d{7}[\s-]?[0-9A-J]\b", re.IGNORECASE),
+            ("nif", "cif", "empresa", "societat", "sociedad", "company", "entitat", "entidad"),
+            True,
+        ),
+        "Empresa / organisme": PatternDef(
+            re.compile(
+                rf"\b([A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ0-9&.'-]{{1,40}}(?:[^\S\n]+(?:de|del|dels|la|les|los|las|i|y|and|the|[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÿ0-9&.'-]{{1,40}})){{1,8}}[^\S\n]+{ORG_SUFFIX})\b",
+                re.IGNORECASE,
+            ),
+            ORG_CONTEXT,
+            True,
+        ),
         "Matricula vehicle": PatternDef(
             re.compile(r"\b(?:[0-9]{4}[\s-]?[BCDFGHJKLMNPRSTVWXYZ]{3}|[A-Z]{1,2}[\s-]?[0-9]{4}[\s-]?[A-Z]{1,2})\b", re.IGNORECASE),
             ("matricula", "matrícula", "placa", "vehicle", "vehiculo", "vehículo", "license plate", "number plate"),
             True,
         ),
         "Codi segur de verificacio (CSV)": PatternDef(
-            re.compile(r"\b(?:CSV|codi segur(?: de verificacio| de verificació)?|c[oó]digo seguro(?: de verificaci[oó]n)?|secure verification code)\s*[:=]\s*([A-Z0-9]+(?:-[A-Z0-9]+){1,5})\b", re.IGNORECASE),
+            re.compile(r"\b(?:CSV|codi(?: segur)?(?: de verificacio| de verificació)?|c[oó]digo(?: seguro)?(?: de verificaci[oó]n)?|secure verification code|verification code)\s*[:=\s]\s*([A-Z0-9]+(?:-[A-Z0-9]+){1,5})\b", re.IGNORECASE),
             ("csv", "codi segur", "codigo seguro", "código seguro", "verificacio", "verificació", "verificacion", "verificación", "secure verification code"),
             True,
         ),
@@ -180,15 +220,26 @@ def get_patterns() -> dict[str, PatternDef]:
                 rf"(?:\b(?:nom(?:\s+i\s+cognoms)?|nombre(?:\s+y\s+apellidos)?|full\s+name|name|apellidos?|cognoms?|titular|clienta?|cliente|customer|contacte|contacto|contact|signat(?:ari)?|signant|firmante|representant|representante|sol[.·]?licitant|solicitante)\s*[:=\-]\s*)?({PERSON_NAME_REGEX})\b"
             ),
             PERSON_CONTEXT,
-            False,
+            True,
         ),
         "Adreca postal": PatternDef(
+            re.compile(ADDRESS_REGEX, re.IGNORECASE),
+            ADDRESS_CONTEXT,
+            True,
+        ),
+        "Adreca postal etiquetada": PatternDef(
             re.compile(
-                r"(?:Gran\s+Via|Avinguda|Avenida|Avenue|Avda\.|Avda|Ave\.|Ave|Av\.|Av|Travessera|Traves[ií]a|Trav\.|Passatge|Ptge\.|Passeig|Pg\.|Paseo|P\.º|Carrer|Calle|Street|St\.|Road|Rd\.|Lane|Ln\.|Drive|Dr\.|Callej\.|Callejon|Callejón|Cal|Bulevar|Blv\.|Boulevard|Urbanitzaci[oó]|Urbanizaci[oó]n|Urb\.|Urb|Pol[ií]gonos?|Pol\.|Glorieta|Glta\.|Rambla|Rbla\.|Ronda|Cam[ií]|Camino|Cami|Pla[cç]a|Plaza|Pza\.|Plza\.|Pl\.|Via|C/)"
-                r"(?:[^\S\n]+(?:de\s+la|de\s+les|de\s+los|de\s+las|dels|del|de|d'))?"
-                r"[^\S\n]+[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'\-]{1,60}[, ]+\d{1,5}[A-Za-z]?"
-                r"(?:[, ]+(?:\d{1,3}[rRtTèéaAºª](?: *[0-9a-zA-Z]{1,3})?|[Bb]aixos|[Bb]ajos|[Ee]ntresol|[Pp]rincipal|[Pp]ral\.?|[Áá]tico|[Àà]tic|[Ll]ocal|[Ee]sc\.? *[A-Z]))?"
-                r"(?:[ ,\-—]+(?:CP|C\.?P\.?|ZIP|Postcode|Postal code)?[ .:]*(?:[0-5]\d{4}|[A-Z]{1,2}\d[A-Z\d]?\s?\d[A-Z]{2})(?: +[A-ZÀ-ÿ][A-Za-zÀ-ÿ \-]{2,30})?)?"
+                rf"\b(?:adre[cç]a|domicili(?:\s+social)?|direcci[oó]n|direccion|address)\s*[:=\-]\s*({ADDRESS_REGEX})"
+                r"|\b(?:carrer|calle)\s*[:=\-]\s*([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'\-]{1,70}(?:[, ]+|[^\S\n]+(?:num\.?|n[uú]m\.?|n[ºo]\.?)[^\S\n]*)\d{1,5}[A-Za-z]?(?:[ ,\-—]+(?:CP|C\.?P\.?)?[ .:]*[0-5]\d{4}(?: +[A-ZÀ-ÿ][A-Za-zÀ-ÿ \-]{2,30})?)?)",
+                re.IGNORECASE,
+            ),
+            ADDRESS_CONTEXT,
+            True,
+        ),
+        "Adreca postal contextual": PatternDef(
+            re.compile(
+                rf"\b(?:domicili(?:\s+a\s+efectes\s+de\s+comunicaci[oó])?|adre[cç]a|direcci[oó]n|direccion|address)[^.\n]{{0,80}}?\s+a\s+([A-ZÀ-ÿ][A-Za-zÀ-ÿ .'\-]{{2,50}},\s*{ADDRESS_REGEX})",
+                re.IGNORECASE,
             ),
             ADDRESS_CONTEXT,
             True,
@@ -237,10 +288,12 @@ def clean_match_value(type_name: str, value: str) -> str:
         "Contrasenya", "Contraseña", "Password",
     )
     label_pattern = r"\s+(?:" + "|".join(re.escape(label) for label in next_label) + r")\b.*$"
-    if type_name in {"Adreca postal", "Adreca postal anglesa", "Contrasenya"}:
+    if type_name in {"Adreca postal", "Adreca postal anglesa", "Adreca postal etiquetada", "Adreca postal contextual", "Contrasenya"}:
         value = re.sub(label_pattern, "", value, flags=re.IGNORECASE).strip(" \t\r\n.;,")
     if type_name == "Contrasenya":
         value = value.rstrip(")")
+    if type_name == "Nom i cognoms":
+        value = re.sub(r"^(?:en|el|la|els|les|sr\.?|sra\.?|senyor|senyora|don|do[nñ]a|mr\.?|mrs\.?)\s+", "", value, flags=re.IGNORECASE)
     return value
 
 
@@ -295,8 +348,66 @@ def is_likely_name_false_positive(value: str) -> bool:
         "direccion", "dirección", "telefono", "teléfono", "correo",
         "electronico", "electrónico", "disponible", "calle", "avenida",
         "paseo", "plaza",
+        "empresa", "societat", "sociedad", "company", "entitat", "entidad",
+        "ajuntament", "agencia", "agència", "administracio", "administració",
+        "tributaria", "tributària", "estatal", "serveis", "servicios",
+        "tecnics", "tècnics", "tecnicos", "técnicos", "xarxes", "redes",
+        "telecomunicacions", "telecomunicaciones", "alternatives",
+        "alternativas", "valor", "afegit", "añadido", "seguretat",
+        "seguridad", "social", "activitats", "actividades", "economiques",
+        "econòmiques", "economicas", "económicas", "prevencio", "prevenció",
+        "prevencion", "prevención", "riscos", "riesgos", "laborals",
+        "laborales", "departament", "ministeri", "ministerio", "institut",
+        "instituto", "responsabilitat", "responsabilidad", "civil",
     }
     return any(f" {term.lower()} " in text for term in non_person_terms)
+
+
+def is_likely_org_false_positive(value: str) -> bool:
+    """Descarta fragments administratius que el NER suele marcar como ORG."""
+
+    clean = norm_val(value).strip(" .,:;()-")
+    if len(clean) < 6 or clean.endswith((" de", " d", " del", " dels")):
+        return True
+    words = clean.split()
+    if len(words) == 1:
+        return True
+
+    false_terms = {
+        "administracio", "administració", "administracion", "administración",
+        "agencia estatal", "agència estatal", "administracio tributaria",
+        "administració tributaria", "administracion tributaria",
+        "administración tributaria", "tresoreria general", "tesoreria general",
+        "seguretat social", "seguridad social", "serveis tecnics",
+        "serveis tècnics", "servicios tecnicos", "servicios técnicos",
+        "policia", "responsabilitat civil", "responsabilidad civil",
+        "valor afegit", "valor añadido", "activitats economiques",
+        "activitats econòmiques", "actividades economicas",
+        "actividades económicas", "prevencio de riscos laborals",
+        "prevenció de riscos laborals", "prevencion de riesgos laborales",
+        "prevención de riesgos laborales", "article", "articulo", "artículo",
+        "text legal", "mateix text legal", "d'acord", "d’acord",
+    }
+    if any(term in clean for term in false_terms):
+        return True
+    if len(words) > 8 and not re.search(ORG_SUFFIX, value, re.IGNORECASE):
+        return True
+    return False
+
+
+def is_likely_company_or_org(value: str) -> bool:
+    """Acepta empresas claras y evita organismos/frases demasiado genericas."""
+
+    if is_likely_org_false_positive(value):
+        return False
+    if re.search(ORG_SUFFIX, value, re.IGNORECASE):
+        return True
+
+    clean = norm_val(value)
+    words = clean.split()
+    if len(words) >= 3 and any(term in clean for term in ("xarxes", "telecomunicacions", "telecomunicaciones")):
+        return True
+    return False
 
 
 def merge_findings(findings: list[Finding], extra: Iterable[Finding]) -> list[Finding]:
@@ -368,13 +479,14 @@ def ner_label(entity: dict[str, Any]) -> str:
 
 
 def scan_ner_entities(text: str, strict: bool) -> list[Finding]:
-    """Detecta personas con NER multilingüe y las agrega al informe."""
+    """Detecta personas y organizaciones con NER multilingüe."""
 
     ner = get_ner_pipeline()
     if ner is None:
         return []
 
     persons: dict[str, str] = {}
+    orgs: dict[str, str] = {}
     lower_text = text.lower()
     has_person_context = any(ctx.lower() in lower_text for ctx in PERSON_CONTEXT)
 
@@ -387,21 +499,31 @@ def scan_ner_entities(text: str, strict: bool) -> list[Finding]:
 
         for entity in entities:
             label = ner_label(entity)
-            if label not in {"PER", "PERSON"}:
-                continue
             if float(entity.get("score") or 0.0) < NER_MIN_SCORE:
                 continue
             value = str(entity.get("word") or "").replace("##", "").strip()
             value = re.sub(r"\s+", " ", value)
-            if not value or is_likely_name_false_positive(value):
+            if not value:
                 continue
-            if not strict and not has_person_context and len(value.split()) < 2:
-                continue
-            persons.setdefault(norm_val(value), value)
 
-    if not persons:
-        return []
-    return [Finding("Nom i cognoms", list(persons.values()))]
+            if label in {"PER", "PERSON"}:
+                value = clean_match_value("Nom i cognoms", value)
+                if is_likely_name_false_positive(value):
+                    continue
+                if not strict and not has_person_context and len(value.split()) < 2:
+                    continue
+                persons.setdefault(norm_val(value), value)
+            elif label in {"ORG", "ORGANIZATION"}:
+                if not is_likely_company_or_org(value):
+                    continue
+                orgs.setdefault(norm_val(value), value)
+
+    findings: list[Finding] = []
+    if persons:
+        findings.append(Finding("Nom i cognoms", list(persons.values())))
+    if orgs:
+        findings.append(Finding("Empresa / organisme", list(orgs.values())))
+    return findings
 
 
 def ascii85_decode(data: bytes) -> bytes:
@@ -446,7 +568,28 @@ def pdf_literal_to_text(value: bytes) -> str:
     return out.decode("utf-8", errors="ignore") or out.decode("latin-1", errors="ignore")
 
 
-def extract_pdf(path: Path) -> str:
+def extract_pdf_with_pypdf(path: Path) -> str:
+    """Extrae texto con pypdf cuando esta disponible."""
+
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return ""
+
+    try:
+        reader = PdfReader(str(path))
+        pages: list[str] = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                pages.append(page_text.strip())
+        return "\n".join(pages)
+    except Exception as exc:
+        print(f"Avis: pypdf no ha pogut extreure text de {path.name} ({exc})", file=sys.stderr)
+        return ""
+
+
+def extract_pdf_builtin(path: Path) -> str:
     """
     Extractor PDF integrado.
 
@@ -502,11 +645,17 @@ def extract_pdf(path: Path) -> str:
 
         offset = end_pos + len(b"endstream")
 
-    ascii_chunks = re.findall(rb"[\x20-\x7E]{6,}", raw)
-    if ascii_chunks and not text:
-        text.append(" ".join(chunk.decode("latin-1", errors="ignore") for chunk in ascii_chunks))
-
     return "\n".join(part.strip() for part in text if part.strip())
+
+
+def extract_pdf(path: Path) -> str:
+    """
+    Extrae texto de PDF usando pypdf como extractor principal.
+
+    El extractor integrado queda como fallback para entornos sin dependencias.
+    """
+
+    return extract_pdf_with_pypdf(path) or extract_pdf_builtin(path)
 
 
 def xml_text(xml_data: bytes, tags: Iterable[str] | None = None) -> str:
@@ -648,9 +797,17 @@ def scan_text(text: str, strict: bool) -> list[Finding]:
 
     findings: list[Finding] = []
     lower_text = text.lower()
+    normalized_text = re.sub(r"[ \t\r\f\v]*\n[ \t\r\f\v]*", " ", text)
+    scan_variants = [text]
+    if normalized_text != text:
+        scan_variants.append(normalized_text)
 
     for type_name, pattern in get_patterns().items():
-        matches = list(pattern.regex.finditer(text))
+        matches = [
+            match
+            for scan_variant in scan_variants
+            for match in pattern.regex.finditer(scan_variant)
+        ]
         if not matches:
             continue
 
@@ -660,15 +817,19 @@ def scan_text(text: str, strict: bool) -> list[Finding]:
 
         unique: dict[str, str] = {}
         for match in matches:
-            original = clean_match_value(type_name, match.group(1) if match.lastindex else match.group(0))
+            captured = next((group for group in match.groups() if group), match.group(0)) if match.lastindex else match.group(0)
+            original = clean_match_value(type_name, captured)
             if type_name == "Matricula vehicle" and norm_val(original).endswith(" csv"):
+                continue
+            if type_name == "Empresa / organisme" and not is_likely_company_or_org(original):
                 continue
             if type_name == "Nom i cognoms" and is_likely_name_false_positive(original):
                 continue
             add_unique_match(unique, original)
 
         if unique:
-            findings.append(Finding(type_name, list(unique.values())))
+            output_type = "Adreca postal" if type_name in {"Adreca postal etiquetada", "Adreca postal contextual"} else type_name
+            findings.append(Finding(output_type, list(unique.values())))
 
     return merge_findings(findings, scan_ner_entities(text, strict))
 
@@ -848,9 +1009,9 @@ def scan_upload_payload(body: bytes, content_type: str, strict: bool, max_size: 
 
 
 def results_are_sensitive(results: list[ScanResult]) -> bool:
-    """Indica si algun resultat ha quedat marcat com sensible."""
+    """Indica si ICAP ha de bloquejar per sensibilitat o inspeccio fallida."""
 
-    return any(result.status == "sensitive" for result in results)
+    return any(result.status in {"sensitive", "error"} for result in results)
 
 
 def collect_files(directory: Path, recursive: bool) -> list[Path]:
@@ -1048,7 +1209,7 @@ def run_icap_server(host: str, port: int, strict: bool, max_size: int) -> int:
             if allowed:
                 self.no_adaptation_required()
             else:
-                error_body = b"Upload bloquejat per dades sensibles.\n"
+                error_body = b"Upload bloquejat: dades sensibles o fitxer no inspeccionable.\n"
                 self.set_icap_response(200)
                 self.set_enc_status(b"HTTP/1.1 403 Forbidden")
                 self.set_enc_header(b"Content-Type", b"text/plain; charset=utf-8")
