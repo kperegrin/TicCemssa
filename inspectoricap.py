@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/local/bin/python3
 """
 Inspector de dades sensibles en Python.
 
@@ -20,8 +20,6 @@ como pypdf.
 from __future__ import annotations
 
 import argparse
-import collections
-import collections.abc
 import datetime as dt
 import os
 import re
@@ -29,6 +27,7 @@ import socketserver
 import sys
 import tempfile
 import time
+import urllib.parse
 import zipfile
 import zlib
 from dataclasses import dataclass
@@ -41,9 +40,25 @@ from xml.etree import ElementTree as ET
 APP_VERSION = "3.1.0-py"
 ROOT = Path(__file__).resolve().parent
 LOG_DIR = ROOT / "logs"
+ICAP_SERVER_NAME = b"SensitiveDataInspector/3.1"
+UPLOAD_METHODS = {"PUT", "POST", "PATCH"}
+BLOCKED_EXTENSIONS = {
+    ".exe", ".bat", ".cmd", ".ps1", ".vbs",
+    ".jar", ".dll", ".scr", ".pif",
+}
+BLOCKED_MIME_TYPES = {
+    "application/x-msdownload",
+    "application/x-executable",
+    "application/x-sh",
+    "application/java-archive",
+    "application/x-bat",
+    "application/x-msdos-program",
+}
 DEFAULT_NER_MODEL = "Babelscape/wikineural-multilingual-ner"
+LOCAL_NER_MODEL_DIR = ROOT / "models" / "wikineural-multilingual-ner"
 NER_MIN_SCORE = 0.75
 NER_MAX_TEXT_CHARS = 250_000
+NER_LOAD_ERROR = ""
 
 PERSON_CONTEXT = (
     "name", "full name", "first name", "last name", "surname", "holder",
@@ -426,6 +441,39 @@ def merge_findings(findings: list[Finding], extra: Iterable[Finding]) -> list[Fi
     return [Finding(type_name, list(matches.values())) for type_name, matches in by_type.items() if matches]
 
 
+def env_enabled(name: str) -> bool:
+    """Interpreta variables de entorno booleanas."""
+
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def configured_ner_model() -> tuple[str, bool]:
+    """
+    Devuelve modelo NER y si debe cargarse solo desde cache/local.
+
+    Prioridad:
+    1. INSPECTOR_NER_MODEL si se define.
+    2. models/wikineural-multilingual-ner local si existe.
+    3. Modelo remoto fijo por defecto.
+    """
+
+    explicit_model = os.environ.get("INSPECTOR_NER_MODEL", "").strip()
+    local_only = env_enabled("INSPECTOR_NER_LOCAL_ONLY")
+    if explicit_model:
+        return explicit_model, local_only
+    if LOCAL_NER_MODEL_DIR.exists():
+        return str(LOCAL_NER_MODEL_DIR), True
+    return DEFAULT_NER_MODEL, local_only
+
+
+def require_ner() -> bool:
+    """Exigeix NER si s'ha demanat o si hi ha un model local empaquetat."""
+
+    if env_enabled("INSPECTOR_DISABLE_NER"):
+        return False
+    return env_enabled("INSPECTOR_REQUIRE_NER") or LOCAL_NER_MODEL_DIR.exists()
+
+
 @lru_cache(maxsize=1)
 def get_ner_pipeline() -> Any | None:
     """
@@ -435,23 +483,31 @@ def get_ner_pipeline() -> Any | None:
     cambiar con INSPECTOR_NER_MODEL o desactivar con INSPECTOR_DISABLE_NER=1.
     """
 
-    if os.environ.get("INSPECTOR_DISABLE_NER", "").lower() in {"1", "true", "yes"}:
+    global NER_LOAD_ERROR
+    NER_LOAD_ERROR = ""
+
+    if env_enabled("INSPECTOR_DISABLE_NER"):
+        NER_LOAD_ERROR = "NER desactivat per INSPECTOR_DISABLE_NER"
         return None
     try:
-        from transformers import pipeline
-    except ImportError:
+        from transformers import AutoModelForTokenClassification, AutoTokenizer, pipeline
+    except ImportError as exc:
+        NER_LOAD_ERROR = f"Falten dependencies NER: {exc}"
         return None
 
-    model_name = os.environ.get("INSPECTOR_NER_MODEL", DEFAULT_NER_MODEL)
+    model_name, local_only = configured_ner_model()
     try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=local_only)
+        model = AutoModelForTokenClassification.from_pretrained(model_name, local_files_only=local_only)
         return pipeline(
             "token-classification",
-            model=model_name,
-            tokenizer=model_name,
+            model=model,
+            tokenizer=tokenizer,
             aggregation_strategy="simple",
         )
     except Exception as exc:
-        print(f"Avis: NER no disponible ({exc})", file=sys.stderr)
+        NER_LOAD_ERROR = f"NER no disponible amb model {model_name!r}: {exc}"
+        print(f"Avis: {NER_LOAD_ERROR}", file=sys.stderr)
         return None
 
 
@@ -483,6 +539,8 @@ def scan_ner_entities(text: str, strict: bool) -> list[Finding]:
 
     ner = get_ner_pipeline()
     if ner is None:
+        if require_ner():
+            return [Finding("NER no disponible", [NER_LOAD_ERROR or "No s'ha pogut carregar el model NER"])]
         return []
 
     persons: dict[str, str] = {}
@@ -984,7 +1042,7 @@ def parse_multipart(body: bytes, content_type: str) -> list[tuple[str, bytes]]:
     return parts
 
 
-def scan_upload_payload(body: bytes, content_type: str, strict: bool, max_size: int) -> list[ScanResult]:
+def scan_upload_payload(body: bytes, content_type: str, strict: bool, max_size: int, filename: str = "") -> list[ScanResult]:
     """Escanea un cuerpo HTTP completo recibido por ICAP."""
 
     if len(body) > max_size:
@@ -1003,9 +1061,92 @@ def scan_upload_payload(body: bytes, content_type: str, strict: bool, max_size: 
 
     parts = parse_multipart(body, content_type)
     if not parts:
-        fallback_name = "upload.pdf" if "pdf" in content_type.lower() else "upload.bin"
+        fallback_name = filename or ("upload.pdf" if "pdf" in content_type.lower() else "upload.bin")
         parts = [(fallback_name, body)]
     return [scan_bytes(payload, filename, strict) for filename, payload in parts]
+
+
+def analyze_upload(filename: str, content_type: str, body: bytes, strict: bool, max_size: int) -> tuple[bool, str, list[ScanResult]]:
+    """Aplica bloqueig basic i el detector de dades sensibles a un upload."""
+
+    safe_name = Path(filename.replace("\\", "/")).name if filename else ""
+    if len(body) > max_size:
+        result = ScanResult(
+            Path(safe_name or "upload.bin"),
+            safe_name or "upload.bin",
+            len(body),
+            Path(safe_name).suffix.lower().lstrip(".") if safe_name else "bin",
+            status="sensitive",
+            message=f"Mida excessiva: {len(body)} bytes",
+            findings=[Finding("Mida maxima", [f"{len(body)} bytes"])],
+            total=1,
+        )
+        return False, result.message, [result]
+
+    if safe_name:
+        _, ext = os.path.splitext(safe_name.lower())
+        if ext in BLOCKED_EXTENSIONS:
+            result = ScanResult(
+                Path(safe_name),
+                safe_name,
+                len(body),
+                ext.lstrip("."),
+                status="sensitive",
+                message=f"Extensio bloquejada: {ext}",
+                findings=[Finding("Extensio bloquejada", [ext])],
+                total=1,
+            )
+            return False, result.message, [result]
+
+    mime = content_type.split(";", 1)[0].strip().lower()
+    if mime in BLOCKED_MIME_TYPES:
+        result = ScanResult(
+            Path(safe_name or "upload.bin"),
+            safe_name or "upload.bin",
+            len(body),
+            Path(safe_name).suffix.lower().lstrip(".") if safe_name else "bin",
+            status="sensitive",
+            message=f"Tipus MIME bloquejat: {mime}",
+            findings=[Finding("Tipus MIME bloquejat", [mime])],
+            total=1,
+        )
+        return False, result.message, [result]
+
+    if len(body) >= 4:
+        blocked_magic = ""
+        if body[:2] == b"MZ":
+            blocked_magic = "Executable Windows detectat (magic bytes MZ)"
+        elif body[:4] == b"\x7fELF":
+            blocked_magic = "Executable Linux detectat (magic bytes ELF)"
+        elif body[:2] == b"#!" and b"sh" in body[:32]:
+            blocked_magic = "Script de shell detectat (shebang #!)"
+        if blocked_magic:
+            result = ScanResult(
+                Path(safe_name or "upload.bin"),
+                safe_name or "upload.bin",
+                len(body),
+                Path(safe_name).suffix.lower().lstrip(".") if safe_name else "bin",
+                status="sensitive",
+                message=blocked_magic,
+                findings=[Finding("Fitxer executable", [blocked_magic])],
+                total=1,
+            )
+            return False, blocked_magic, [result]
+
+    results = scan_upload_payload(body, content_type, strict, max_size, safe_name)
+    if results_are_sensitive(results):
+        reasons = []
+        for result in results:
+            if result.status == "error" and result.message:
+                reasons.append(result.message)
+            if result.status == "sensitive" and result.findings:
+                reasons.extend(finding.type for finding in result.findings)
+        reason = "Dades sensibles detectades"
+        if reasons:
+            reason = "; ".join(dict.fromkeys(reasons[:6]))
+        return False, reason, results
+
+    return True, "OK", results
 
 
 def results_are_sensitive(results: list[ScanResult]) -> bool:
@@ -1136,20 +1277,6 @@ def generate_pdf(results: list[ScanResult], scan_path: str, elapsed: float, outp
     output.write_bytes(bytes(output_bytes))
 
 
-def get_icap_header(handler: object, name: str) -> str:
-    """Lee una cabecera HTTP/ICAP de pyicap tolerando claves str o bytes."""
-
-    headers = getattr(handler, "enc_req_headers", {}) or getattr(handler, "headers", {}) or {}
-    wanted = name.lower()
-    for key, value in getattr(headers, "items", lambda: [])():
-        key_text = key.decode("latin-1", errors="ignore") if isinstance(key, bytes) else str(key)
-        if key_text.lower() == wanted:
-            if isinstance(value, list):
-                value = value[0] if value else b""
-            return value.decode("latin-1", errors="ignore") if isinstance(value, bytes) else str(value)
-    return ""
-
-
 def log_icap_results(results: list[ScanResult], allowed: bool) -> None:
     """Guarda un informe curt de cada peticio ICAP analitzada."""
 
@@ -1159,66 +1286,241 @@ def log_icap_results(results: list[ScanResult], allowed: bool) -> None:
     output.write_text(generate_txt(results, "ICAP upload", 0), encoding="utf-8")
 
 
-def run_icap_server(host: str, port: int, strict: bool, max_size: int) -> int:
-    """
-    Arranca el servidor ICAP REQMOD.
+def read_headers(rfile: object) -> dict[bytes, bytes]:
+    """Llegeix capcaleres ICAP/HTTP des d'un StreamRequestHandler."""
 
-    Requiere instalar pyicap:
-        pip install pyicap
-    """
+    headers: dict[bytes, bytes] = {}
+    while True:
+        line = rfile.readline()
+        if not line or line in (b"\r\n", b"\n"):
+            break
+        if b":" in line:
+            key, _, value = line.partition(b":")
+            headers[key.strip().lower()] = value.strip()
+    return headers
 
-    # pyicap encara referencia collections.Callable, eliminat en Python modern.
-    # Afegim l'alias abans d'importar pyicap per mantenir compatibilitat.
-    if not hasattr(collections, "Callable"):
-        collections.Callable = collections.abc.Callable
+
+def read_chunked(rfile: object, max_bytes: int) -> bytes:
+    """Llegeix un cos chunked ICAP fins al final o fins al maxim."""
+
+    body = bytearray()
+    while True:
+        size_line = rfile.readline().strip()
+        if not size_line:
+            break
+        try:
+            chunk_size = int(size_line.split(b";", 1)[0], 16)
+        except ValueError:
+            break
+        if chunk_size == 0:
+            rfile.readline()
+            break
+        chunk = rfile.read(chunk_size)
+        rfile.readline()
+        body.extend(chunk)
+        if len(body) >= max_bytes:
+            break
+    return bytes(body)
+
+
+def extract_filename_from_url(url: str) -> str:
+    """Extreu un nom de fitxer de la URL sense confondre dominis amb fitxers."""
+
+    match = re.search(r"[?&](?:filename|name)=([^&/]+)", url, re.IGNORECASE)
+    if match:
+        name = urllib.parse.unquote(match.group(1))
+        if "." in name and not name.replace(".", "").isdigit():
+            return Path(name.replace("\\", "/")).name
+
+    match = re.search(r"/root:/([^:/]+\.[a-zA-Z0-9]+)(?::/|$)", url)
+    if match:
+        return Path(urllib.parse.unquote(match.group(1)).replace("\\", "/")).name
+
+    path = url.split("?", 1)[0].rstrip("/")
+    segment = urllib.parse.unquote(path.split("/")[-1])
+    if "." in segment and not re.match(r"^\d+\.\d+\.\d+\.\d+", segment):
+        _, ext = os.path.splitext(segment.lower())
+        if ext in BLOCKED_EXTENSIONS or len(ext) <= 5:
+            return Path(segment.replace("\\", "/")).name
+    return ""
+
+
+def extract_filename_from_headers(headers: dict[bytes, bytes]) -> str:
+    """Extreu filename de Content-Disposition si hi es."""
+
+    disposition = headers.get(b"content-disposition", b"").decode("latin-1", errors="replace")
+    match = re.search(r"filename\*=([^;\r\n]+)", disposition, re.IGNORECASE)
+    if match:
+        value = match.group(1).strip().strip("\"'")
+        if "''" in value:
+            value = value.split("''", 1)[1]
+        return Path(urllib.parse.unquote(value).replace("\\", "/")).name
+
+    match = re.search(r"filename=[\"']?([^\"';\r\n]+)[\"']?", disposition, re.IGNORECASE)
+    if match:
+        return Path(urllib.parse.unquote(match.group(1).strip()).replace("\\", "/")).name
+    return ""
+
+
+def extract_filename_from_multipart(body: bytes, content_type: str) -> str:
+    """Busca un filename dins d'un multipart/form-data."""
+
+    if "multipart" not in content_type.lower():
+        return ""
+    try:
+        text = body[:8192].decode("latin-1", errors="replace")
+    except Exception:
+        return ""
+    match = re.search(r'filename="([^"]+)"', text, re.IGNORECASE)
+    if match:
+        return Path(urllib.parse.unquote(match.group(1)).replace("\\", "/")).name
+    return ""
+
+
+def send_icap_raw(wfile: object, status: bytes) -> None:
+    """Envia una resposta ICAP simple sense cos encapsulat."""
+
+    wfile.write(b"ICAP/1.0 " + status + b"\r\n")
+    wfile.write(b"Server: " + ICAP_SERVER_NAME + b"\r\n")
+    wfile.write(b'ISTag: "SensitiveDataInspector-3.1"\r\n')
+    wfile.write(b"Encapsulated: null-body=0\r\n\r\n")
+    wfile.flush()
+
+
+def send_icap_options(wfile: object) -> None:
+    """Resposta OPTIONS per al servei REQMOD."""
+
+    wfile.write(b"ICAP/1.0 200 OK\r\n")
+    wfile.write(b"Methods: REQMOD\r\n")
+    wfile.write(b"Service: Sensitive Data Inspector ICAP\r\n")
+    wfile.write(b"Server: " + ICAP_SERVER_NAME + b"\r\n")
+    wfile.write(b'ISTag: "SensitiveDataInspector-3.1"\r\n')
+    wfile.write(b"Allow: 204\r\n")
+    wfile.write(b"Preview: 0\r\n")
+    wfile.write(b"Transfer-Complete: *\r\n")
+    wfile.write(b"Encapsulated: null-body=0\r\n\r\n")
+    wfile.flush()
+
+
+def send_icap_block(wfile: object, filename: str, reason: str) -> None:
+    """Retorna un HTTP 403 encapsulat en una resposta ICAP 200."""
+
+    safe_filename = filename or "upload"
+    page = (
+        "<html><body><h1>Pujada bloquejada</h1>"
+        f"<p>Fitxer: {safe_filename}</p>"
+        f"<p>Motiu: {reason}</p></body></html>"
+    ).encode("utf-8", errors="replace")
+    response_headers = (
+        b"HTTP/1.1 403 Forbidden\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"Content-Length: " + str(len(page)).encode("ascii") + b"\r\n\r\n"
+    )
+    enc_value = b"res-hdr=0, res-body=" + str(len(response_headers)).encode("ascii")
+    wfile.write(b"ICAP/1.0 200 OK\r\n")
+    wfile.write(b"Server: " + ICAP_SERVER_NAME + b"\r\n")
+    wfile.write(b'ISTag: "SensitiveDataInspector-3.1"\r\n')
+    wfile.write(b"Encapsulated: " + enc_value + b"\r\n\r\n")
+    wfile.write(response_headers)
+    wfile.write(hex(len(page))[2:].encode("ascii") + b"\r\n")
+    wfile.write(page + b"\r\n0\r\n\r\n")
+    wfile.flush()
+
+
+def install_ner_model() -> int:
+    """Descarrega el model NER fix al directori local models/."""
 
     try:
-        from pyicap import BaseICAPRequestHandler, ICAPServer
+        from huggingface_hub import snapshot_download
     except ImportError:
-        print("ERROR: falta pyicap. Instal-la amb: pip install pyicap", file=sys.stderr)
+        print("ERROR: falta huggingface_hub. Instal-la amb: python -m pip install huggingface_hub", file=sys.stderr)
         return 2
 
-    class ScanHandler(BaseICAPRequestHandler):
-        """Handler ICAP que reutilitza la logica DLP de l'inspector."""
+    LOCAL_NER_MODEL_DIR.parent.mkdir(parents=True, exist_ok=True)
+    print(f"Descarregant model NER a: {LOCAL_NER_MODEL_DIR}")
+    snapshot_download(
+        repo_id=DEFAULT_NER_MODEL,
+        local_dir=str(LOCAL_NER_MODEL_DIR),
+        local_dir_use_symlinks=False,
+    )
+    print("Model NER local preparat.")
+    return 0
 
-        def scan_OPTIONS(self):
-            self.set_icap_response(200)
-            self.set_icap_header(b"Methods", b"REQMOD")
-            self.set_icap_header(b"Service", b"Sensitive Data Inspector ICAP")
-            self.set_icap_header(b"Preview", b"0")
-            self.set_icap_header(b"Transfer-Complete", b"*")
-            self.send_headers(False)
 
-        def scan_REQMOD(self):
-            body = bytearray()
-            if self.has_body:
+def run_icap_server(host: str, port: int, strict: bool, max_size: int) -> int:
+    """Arranca el servidor ICAP REQMOD compatible amb OPNsense."""
+
+    class ScanHandler(socketserver.StreamRequestHandler):
+        """Handler ICAP manual que reutilitza la logica DLP de l'inspector."""
+
+        def handle(self) -> None:
+            try:
                 while True:
-                    chunk = self.read_chunk()
-                    if chunk == b"":
+                    request_line = self.rfile.readline()
+                    if not request_line:
                         break
-                    body.extend(chunk)
-                    if len(body) > max_size:
+                    request_line = request_line.strip()
+                    if not request_line:
+                        continue
+
+                    parts = request_line.split(b" ")
+                    if len(parts) < 2:
                         break
+                    method = parts[0].upper()
+                    icap_headers = read_headers(self.rfile)
 
-            content_type = get_icap_header(self, "Content-Type")
-            results = scan_upload_payload(bytes(body), content_type, strict, max_size)
-            allowed = not results_are_sensitive(results)
-            if not allowed:
-                log_icap_results(results, allowed)
+                    if method == b"OPTIONS":
+                        send_icap_options(self.wfile)
+                    elif method == b"REQMOD":
+                        self.handle_reqmod(icap_headers)
+                    else:
+                        send_icap_raw(self.wfile, b"400 Bad Request")
+                    break
+            except Exception as exc:
+                print(f"ERROR ICAP: {exc}", file=sys.stderr)
 
+        def handle_reqmod(self, icap_headers: dict[bytes, bytes]) -> None:
+            client_ip = icap_headers.get(b"x-client-ip", b"unknown").decode("latin-1", errors="replace")
+            encapsulated = icap_headers.get(b"encapsulated", b"").decode("latin-1", errors="replace").lower()
+            has_req_hdr = "req-hdr" in encapsulated
+            has_req_body = "req-body" in encapsulated
+
+            http_method = ""
+            http_url = ""
+            http_headers: dict[bytes, bytes] = {}
+
+            if has_req_hdr:
+                req_line = self.rfile.readline().decode("latin-1", errors="replace").strip()
+                parts = req_line.split(" ")
+                if len(parts) >= 2:
+                    http_method = parts[0].upper()
+                    http_url = parts[1]
+                http_headers = read_headers(self.rfile)
+
+            body = read_chunked(self.rfile, max_size) if has_req_body else b""
+            if http_method not in UPLOAD_METHODS or not body:
+                send_icap_raw(self.wfile, b"204 No Modifications Needed")
+                return
+
+            content_type = http_headers.get(b"content-type", b"").decode("latin-1", errors="replace")
+            filename = extract_filename_from_url(http_url) or extract_filename_from_headers(http_headers)
+            if not filename:
+                filename = extract_filename_from_multipart(body, content_type)
+
+            allowed, reason, results = analyze_upload(filename, content_type, body, strict, max_size)
             if allowed:
-                self.no_adaptation_required()
-            else:
-                error_body = b"Upload bloquejat: dades sensibles o fitxer no inspeccionable.\n"
-                self.set_icap_response(200)
-                self.set_enc_status(b"HTTP/1.1 403 Forbidden")
-                self.set_enc_header(b"Content-Type", b"text/plain; charset=utf-8")
-                self.set_enc_header(b"Content-Length", str(len(error_body)).encode("ascii"))
-                self.send_headers(True)
-                self.write_chunk(error_body)
-                self.write_chunk(b"")
+                send_icap_raw(self.wfile, b"204 No Modifications Needed")
+                return
 
-    class ThreadedServer(socketserver.ThreadingMixIn, ICAPServer):
+            log_icap_results(results, allowed=False)
+            print(
+                f"ICAP bloquejat IP={client_ip} metode={http_method!r} "
+                f"fitxer={filename!r} mida={len(body)} motiu={reason}",
+                file=sys.stderr,
+            )
+            send_icap_block(self.wfile, filename, reason)
+
+    class ThreadedServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         daemon_threads = True
         allow_reuse_address = True
 
@@ -1248,6 +1550,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--icap-host", default="127.0.0.1", help="Host del servidor ICAP")
     parser.add_argument("--icap-port", type=int, default=1345, help="Port del servidor ICAP")
     parser.add_argument("--icap-max-size", type=int, default=100 * 1024 * 1024, help="Mida maxima d'upload en bytes")
+    parser.add_argument("--install-ner-model", action="store_true", help="Descarrega el model NER fix a models/")
     return parser.parse_args(argv)
 
 
@@ -1256,6 +1559,9 @@ def main(argv: list[str]) -> int:
 
     start = time.time()
     args = parse_args(argv)
+
+    if args.install_ner_model:
+        return install_ner_model()
 
     if args.icap:
         return run_icap_server(args.icap_host, args.icap_port, args.strict, args.icap_max_size)
